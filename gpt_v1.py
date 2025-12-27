@@ -1,4 +1,3 @@
-from sympy import N
 import torch
 import torch.nn as nn
 from torch.nn import ReLU, functional as F
@@ -78,23 +77,42 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(n_embd, n_embd)
 
     def forward(self, x):
-        return torch.cat([h(x) for h in self.heads], dim = -1)
+        out = torch.cat([h(x) for h in self.heads], dim = -1)
+        out = self.proj(out)
+        return out
 
 
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(n_embd, n_embd),
+            nn.Linear(n_embd, 4* n_embd),
             nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd)
         )
 
     def forward(self, x):
         return self.net(x)
 
 
+class Block(nn.Module):
+    """ Transformer block: communication followed by computation"""
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+    
+    def forward(self, x):
+        x = x + self.sa(x)
+        x =  x + self.ffwd(x)
+        return x
+
+
+    
 class GPTLanguageModel(nn.Module):
 
     def __init__(self):
@@ -124,9 +142,29 @@ class GPTLanguageModel(nn.Module):
             loss= F.cross_entropy(logits, targets)
         return logits, loss
 
+    def generate(self, idx, max_new_tokens):
+        # idx is (B, T) array of indices in the current context
+        for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]
+            # get the predictions
+            logits, loss = self(idx_cond)
+            # focus only on the last time step
+            logits = logits[:, -1, :] # becomes (B, C)
+            # apply softmax to get probabilities
+            probs = F.softmax(logits, dim=-1) # (B, C)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            # append sampled index to the running sequence
+            idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
+        return idx
 
 
 
+model = GPTLanguageModel()
+m = model.to(device)
+# print the number of parameters in the model
+print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 
 
