@@ -1,20 +1,20 @@
 import torch
 import torch.nn as nn
-from torch.nn import ReLU, functional as F
+from torch.nn import LayerNorm, ReLU, functional as F
 
 
 # hyperparameters
-batch_size = 16 # how many independent sequences will we process in parallel?
-block_size = 32 # what is the maximum context length for predictions?
+batch_size = 64  # how many independent sequences will we process in parallel?
+block_size = 256 # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 100
-learning_rate = 1e-3
+learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 eval_iters = 200
-n_embd = 64
-n_head = 4
-n_layer = 4
-dropout = 0.0
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
 # ------------
 
 torch.manual_seed(1337)
@@ -48,6 +48,19 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
 
 class Head(nn.Module):
     """one head of self attention"""
@@ -105,10 +118,12 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffwd = FeedForward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
     
     def forward(self, x):
-        x = x + self.sa(x)
-        x =  x + self.ffwd(x)
+        x = x + self.sa(self.ln1(x))     # pre_ln
+        x =  x + self.ffwd(self.ln2(x))
         return x
 
 
@@ -119,6 +134,12 @@ class GPTLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head= 4),
+            Block(n_embd, n_head= 4),
+            Block(n_embd, n_head = 4),
+            nn.LayerNorm(n_embd)
+        )
         self.sa_heads = MultiHeadAttention(4, n_embd // 4) # 4 heads of 8 demision
         self.ffwd = FeedForward(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)            
@@ -136,7 +157,7 @@ class GPTLanguageModel(nn.Module):
         if targets is None:
             loss  = None
         else:
-            B,T,C = logits.shape    # 这边的C已经经过 self.lm_head  维度变成vocab size
+            B,T,C = logits.shape    # 这边的C已经经过 self.lm_head 最后的一层  维度变成vocab size
             logits = logits.view(B * T, C)
             targets = targets.view(B * T)
             loss= F.cross_entropy(logits, targets)
@@ -167,11 +188,29 @@ m = model.to(device)
 print(sum(p.numel() for p in m.parameters())/1e6, 'M parameters')
 
 
+# create a PyTorch optimizer
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+for iter in range(max_iters):
+
+    # every once in a while evaluate the loss on train and val sets
+    if iter % eval_interval == 0 or iter == max_iters - 1:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+    # sample a batch of data
+    xb, yb = get_batch('train')
+
+    # evaluate the loss
+    logits, loss = model(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
 
 
-
-
-
+# generate from the model
+context = torch.zeros((1, 1), dtype=torch.long, device=device)
+print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
         
 
 
