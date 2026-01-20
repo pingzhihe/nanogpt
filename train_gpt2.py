@@ -4,7 +4,7 @@ import torch.nn as nn
 from torch.nn import Embedding, LayerNorm, functional as F
 import math
 import inspect
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+import os
 
 
 #--------------------------------------------------
@@ -216,6 +216,7 @@ class GPT(nn.Module):
 #---------------------------------
 # create a dataloader
 import tiktoken
+import time
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
@@ -239,29 +240,55 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+# End of dataloader and model implementation
+#------------------------------------------------------------------
+# torchrun --standalone --nproc_per_node=2 train_gpt2.py    
+from torch.distributed import init_process_group, destroy_process_group
+# Set up DDP (distributed data parrallel)
 
-#---------------------------------
-# attempt to autodetect the device
-import time
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
+ddp = int(os.environ.get('RANK',-1)) != -1
+if (ddp):
+    assert torch.cuda.is_available(),"for now i think we need cuda for DDP"
+    init_process_group(backend = 'nccl')  #  Using NVIDIA Collective Communications Library
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0  # this process will do logging, checkpoint etc
+else:
+    # vanilla, non-DDP run
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    # attempt to autodetect the device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
-#---------------------------------
+
+
+
+#------------------------------------------------------------------
 # get a data batch
 total_batch_size = 524288  # 2**19,~0.5M tokens nice number
 B,T = 8, 1024
-assert total_batch_size % (B * T) == 0
-grad_accum_steps = total_batch_size // (B * T)
-print(f"total desired batch size:{total_batch_size}")
-print(f"=> calculate gradient accumulation steps:{grad_accum_steps}")
+assert total_batch_size % (B * T * ddp_world_size) == 0
+grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
+if master_process:
+    print(f"total desired batch size:{total_batch_size}")
+    print(f"=> calculate gradient accumulation steps:{grad_accum_steps}")
+
+print("I am GPU", ddp_rank)
+print("Bye")
 
 train_loader = DataLoaderLite(B = B, T = T)
 torch.set_float32_matmul_precision('high')
