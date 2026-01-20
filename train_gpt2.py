@@ -213,11 +213,6 @@ class GPT(nn.Module):
 
 
 
-
-
-
-
-
 #---------------------------------
 # create a dataloader
 import tiktoken
@@ -261,8 +256,14 @@ if torch.cuda.is_available():
 
 #---------------------------------
 # get a data batch
-B,T = 4, 512
-train_loader = DataLoaderLite(B, T)
+total_batch_size = 524288  # 2**19,~0.5M tokens nice number
+B,T = 8, 1024
+assert total_batch_size % (B * T) == 0
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size:{total_batch_size}")
+print(f"=> calculate gradient accumulation steps:{grad_accum_steps}")
+
+train_loader = DataLoaderLite(B = B, T = T)
 torch.set_float32_matmul_precision('high')
 
 
@@ -295,13 +296,17 @@ optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4,
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
-        logits, loss = model(x, y)
-        # import code; code.interact(local=locals())
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        loss.backward()
+    
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -309,9 +314,10 @@ for step in range(max_steps):
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
-    dt = (t1 - t0) * 1000
-    tokens_per_second = B * T / (dt / 1000)
-    print(f"step{step:4d}| loss: {loss.item():.6f}| | lr{lr:.4e} |norm:{norm:.4f} dt: {dt:.2f}ms| tokens/s: {tokens_per_second:.2f}")
+    dt = t1 - t0
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_second = tokens_processed / dt
+    print(f"step{step:4d}| loss: {loss_accum.item():.6f}| | lr{lr:.4e} |norm:{norm:.4f} dt: {dt*1000:.2f}ms| tokens/s: {tokens_per_second:.2f}")
 
 
 
